@@ -935,3 +935,46 @@ void d3d12core_dxgi_bridge_install(IDXGIAdapter *adapter)
 
     ReleaseSRWLockExclusive(&lock);
 }
+
+/* Madeira: create a D3D12 swapchain directly, without DXMT's dxgi.dll.
+ *
+ * DXMT's dxgi factory rejects a D3D12 queue, and its vtable cannot be hooked
+ * from PE code: it lives in FEX's MAP_JIT x64 pool, where a VirtualProtect+store
+ * is silently dropped by iOS JIT write protection (confirmed on device:
+ * "slot15 read-back ... write LOST"). So instead of intercepting dxgi, expose
+ * the swapchain builder as a plain export. An app (or test) that has an
+ * ID3D12CommandQueue and an HWND can call this to get a working IDXGISwapChain1
+ * backed by vkd3d-proton's IDXGIVkSwapChain -> a Vulkan/Metal surface. This is
+ * the same code the (unreachable) dxgi hook would have run. */
+__declspec(dllexport) HRESULT WINAPI madeira_d3d12_create_swapchain(IUnknown *queue,
+        HWND hwnd, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGISwapChain1 **swapchain)
+{
+    IDXGIVkSwapChainFactory *vk_factory;
+    IDXGIFactory2 *factory = NULL;
+    HRESULT hr;
+
+    if (!queue || !swapchain)
+        return DXGI_ERROR_INVALID_CALL;
+    *swapchain = NULL;
+
+    if (FAILED(hr = IUnknown_QueryInterface(queue, &MAD_IID_IDXGIVkSwapChainFactory, (void **)&vk_factory)))
+    {
+        ERR("madeira: queue does not expose IDXGIVkSwapChainFactory, hr %#x.\n", hr);
+        return hr;
+    }
+
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory2, (void **)&factory)))
+    {
+        ERR("madeira: CreateDXGIFactory1 failed.\n");
+        IDXGIVkSwapChainFactory_Release(vk_factory);
+        return E_FAIL;
+    }
+
+    WARN("madeira: creating D3D12 swapchain directly (bypassing dxgi.dll) on hwnd %p.\n", hwnd);
+    hr = bridge_create_swapchain(factory, vk_factory, hwnd, desc, NULL, swapchain);
+    WARN("madeira: direct swapchain creation hr %#x, swapchain %p.\n", hr, (void *)*swapchain);
+
+    IDXGIVkSwapChainFactory_Release(vk_factory);
+    IDXGIFactory2_Release(factory);
+    return hr;
+}
