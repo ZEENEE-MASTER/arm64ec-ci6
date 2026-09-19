@@ -183,3 +183,21 @@ patch(vkd3d / "meta.c",
       "    (void)gdeflate_subgroup_ops;\n"
       "    return S_OK;\n",
       "Madeira: MoltenVK cannot compile vkd3d's memory-decompression")
+
+# Madeira: vkd3d's debug string helper get_buffer() uses VKD3D_THREAD_LOCAL
+# (__thread) ring buffers. On iOS, DXGI Present / swapchain creation and MoltenVK
+# callbacks run on native threads that Wine never set up per-module TLS for, so
+# TEB->ThreadLocalStoragePointer[_tls_index] is unmapped and any vkd3d log call
+# (even an always-on ERR/FIXME, which VKD3D_DEBUG=none does not suppress) segfaults
+# inside vkd3d_dbg_sprintf -> get_buffer. Confirmed on device: c0000005 at
+# d3d12core!vkd3d_dbg_sprintf, faulting on the __thread buffer load, on the
+# swapchain thread, before any pixels are drawn. Make the buffers shared statics:
+# racy log text under contention is harmless; a crash is not.
+patch(src / "libs" / "vkd3d-common" / "debug.c",
+      "    static VKD3D_THREAD_LOCAL char buffers[VKD3D_DEBUG_BUFFER_COUNT][VKD3D_DEBUG_BUFFER_SIZE];\n"
+      "    static VKD3D_THREAD_LOCAL size_t buffer_index;\n",
+      "    /* Madeira: not thread-local -- present/MoltenVK threads have no Wine\n"
+      "       per-module TLS, so a __thread access here segfaults. Shared is fine. */\n"
+      "    static char buffers[VKD3D_DEBUG_BUFFER_COUNT][VKD3D_DEBUG_BUFFER_SIZE];\n"
+      "    static size_t buffer_index;\n",
+      "Madeira: not thread-local -- present/MoltenVK threads")
