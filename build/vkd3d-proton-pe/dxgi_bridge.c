@@ -849,53 +849,89 @@ static HRESULT STDMETHODCALLTYPE bridge_factory_CreateSwapChain(IDXGIFactory2 *f
     return hr;
 }
 
+/* Madeira: hook one factory's vtable in place. Logs the pointers and reads the
+ * slot back so we can see, on device, whether the write to DXMT's (x64) dxgi
+ * vtable actually landed in the view the x64 app reads. Returns the vtbl hooked
+ * (or that was already hooked), else NULL. */
+static IDXGIFactory2Vtbl *bridge_hook_factory_vtbl(IDXGIFactory2 *factory, const char *how)
+{
+    IDXGIFactory2Vtbl *vtbl = (IDXGIFactory2Vtbl *)factory->lpVtbl;
+    DWORD old_protect;
+    void *readback;
+
+    WARN("dxgi bridge: [%s] factory %p vtbl %p slot15(CreateSwapChainForHwnd)=%p mine=%p\n",
+            how, factory, vtbl, (void *)vtbl->CreateSwapChainForHwnd,
+            (void *)bridge_factory_CreateSwapChainForHwnd);
+
+    if (vtbl->CreateSwapChainForHwnd == bridge_factory_CreateSwapChainForHwnd)
+        return vtbl; /* already hooked (shared vtable) */
+
+    if (!VirtualProtect(vtbl, sizeof(*vtbl), PAGE_READWRITE, &old_protect))
+    {
+        ERR("dxgi bridge: [%s] VirtualProtect on vtbl %p failed, error %lu.\n", how, vtbl, GetLastError());
+        return NULL;
+    }
+
+    if (!original_CreateSwapChainForHwnd)
+    {
+        original_CreateSwapChain = vtbl->CreateSwapChain;
+        original_CreateSwapChainForHwnd = vtbl->CreateSwapChainForHwnd;
+    }
+    vtbl->CreateSwapChain = bridge_factory_CreateSwapChain;
+    vtbl->CreateSwapChainForHwnd = bridge_factory_CreateSwapChainForHwnd;
+    VirtualProtect(vtbl, sizeof(*vtbl), old_protect, &old_protect);
+
+    readback = (void *)vtbl->CreateSwapChainForHwnd;
+    WARN("dxgi bridge: [%s] hooked vtbl %p; slot15 read-back=%p (write %s)\n",
+            how, vtbl, readback,
+            readback == (void *)bridge_factory_CreateSwapChainForHwnd ? "STUCK" : "LOST");
+    return vtbl;
+}
+
 void d3d12core_dxgi_bridge_install(IDXGIAdapter *adapter)
 {
     static SRWLOCK lock = SRWLOCK_INIT;
-    IDXGIFactory2 *factory = NULL;
-    IDXGIFactory2Vtbl *vtbl;
+    HRESULT (WINAPI *create_factory2)(UINT, REFIID, void **);
+    IDXGIFactory2 *factory = NULL, *factory2 = NULL;
+    IDXGIFactory2Vtbl *v1 = NULL;
     const char *env;
-    DWORD old_protect;
+    HMODULE dxgi;
 
     if ((env = getenv("VKD3D_DXGI_BRIDGE")) && env[0] == '0')
         return;
 
+    AcquireSRWLockExclusive(&lock);
+
+    /* Path A: the factory that owns this adapter (or CreateDXGIFactory1). */
     if (!adapter || FAILED(IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory2, (void **)&factory)))
     {
-        /* CreateDXGIFactory1 on purpose: d3d12core.dll already imports it, so
-         * this adds no new import that a dxgi.dll might lack. */
         if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory2, (void **)&factory)))
-        {
-            WARN("dxgi bridge: no IDXGIFactory2 to hook.\n");
-            return;
-        }
+            factory = NULL;
     }
-
-    AcquireSRWLockExclusive(&lock);
-    vtbl = (IDXGIFactory2Vtbl *)factory->lpVtbl;
-    if (vtbl->CreateSwapChainForHwnd != bridge_factory_CreateSwapChainForHwnd)
+    if (factory)
     {
-        if (VirtualProtect(vtbl, sizeof(*vtbl), PAGE_READWRITE, &old_protect))
-        {
-            /* One set of originals: a process has one dxgi.dll, hence one
-             * factory class. A second, different vtable would be unusual; keep
-             * the first originals rather than chain to our own hooks. */
-            if (!original_CreateSwapChainForHwnd)
-            {
-                original_CreateSwapChain = vtbl->CreateSwapChain;
-                original_CreateSwapChainForHwnd = vtbl->CreateSwapChainForHwnd;
-                vtbl->CreateSwapChain = bridge_factory_CreateSwapChain;
-                vtbl->CreateSwapChainForHwnd = bridge_factory_CreateSwapChainForHwnd;
-                WARN("dxgi bridge: hooked factory vtable %p (DXGI swapchains for D3D12 queues).\n", vtbl);
-            }
-            VirtualProtect(vtbl, sizeof(*vtbl), old_protect, &old_protect);
-        }
-        else
-        {
-            ERR("dxgi bridge: VirtualProtect on factory vtable %p failed, error %lu.\n", vtbl, GetLastError());
-        }
+        v1 = bridge_hook_factory_vtbl(factory, "GetParent/Factory1");
+        IDXGIFactory2_Release(factory);
     }
-    ReleaseSRWLockExclusive(&lock);
+    else
+        WARN("dxgi bridge: no IDXGIFactory2 via GetParent/Factory1.\n");
 
-    IDXGIFactory2_Release(factory);
+    /* Path B: a factory created exactly like the app does -- CreateDXGIFactory2,
+     * resolved dynamically from dxgi.dll so d3d12core needs no extra import. If
+     * its vtable differs from path A, hook it too (the app uses this one). */
+    if ((dxgi = GetModuleHandleA("dxgi.dll"))
+            && (create_factory2 = (void *)GetProcAddress(dxgi, "CreateDXGIFactory2"))
+            && SUCCEEDED(create_factory2(0, &IID_IDXGIFactory2, (void **)&factory2)))
+    {
+        IDXGIFactory2Vtbl *v2 = (IDXGIFactory2Vtbl *)factory2->lpVtbl;
+        if ((void *)v2 != (void *)v1)
+            bridge_hook_factory_vtbl(factory2, "CreateDXGIFactory2");
+        else
+            WARN("dxgi bridge: CreateDXGIFactory2 shares vtbl %p (already hooked).\n", v2);
+        IDXGIFactory2_Release(factory2);
+    }
+    else
+        WARN("dxgi bridge: CreateDXGIFactory2 unavailable for cross-check.\n");
+
+    ReleaseSRWLockExclusive(&lock);
 }
