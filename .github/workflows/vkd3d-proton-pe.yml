@@ -63,7 +63,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: out
-          key: vkd3d-proton-v2-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
+          key: vkd3d-proton-v3-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
 
       - name: Host tools
         if: steps.cache.outputs.cache-hit != 'true'
@@ -158,10 +158,17 @@ jobs:
           # on device: wild ldr at TLSbase + 0xffffffff*8). Pure ARM64EC has a
           # single runtime/_tls_index; x64 callers thunk into the EC code. It is
           # still x64-loadable, which is all Madeira needs.
+          # --section-alignment=0x4000: iOS uses 16 KB pages, and MadeiraPad's
+          # ecdata fix (vm_remap the original image's writable .data onto the FEX
+          # pool copy, so the loader's _tls_index write is visible to the code that
+          # actually runs) requires each writable section to start on a 16 KB
+          # boundary in both views. At the PE default 0x1000, d3d12core's .data is
+          # "not on 16 KB pages in both views - skipped", so __thread on the
+          # swapchain path reads a stale 0xffffffff index and faults.
           c_args = ['-march=armv8.2-a', '-O2', '-ffunction-sections', '-fdata-sections']
           cpp_args = ['-march=armv8.2-a', '-O2', '-ffunction-sections', '-fdata-sections', '-include', 'LIBCXX_COMPAT_PATH']
-          c_link_args = []
-          cpp_link_args = []
+          c_link_args = ['-Wl,--section-alignment=0x4000']
+          cpp_link_args = ['-Wl,--section-alignment=0x4000']
 
           [host_machine]
           system = 'windows'
@@ -230,7 +237,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: out
-          key: vkd3d-proton-v2-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
+          key: vkd3d-proton-v3-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
 
       - uses: actions/upload-artifact@v4
         with:
