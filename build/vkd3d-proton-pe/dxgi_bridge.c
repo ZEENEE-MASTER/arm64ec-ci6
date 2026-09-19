@@ -64,6 +64,26 @@ static const GUID MAD_IID_IDXGIVkSwapChainFactory =
 static const GUID MAD_IID_IDXGIVkSwapChain1 =
     {0x785326d4,0xb77b,0x4826,{0xae,0x70,0x8d,0x08,0x30,0x8e,0xe6,0xd1}};
 
+/* Madeira: real games reach the swapchain through DXGI (CreateDXGIFactory2 +
+ * CreateSwapChainForHwnd), not the direct export. The factory vtable slot must
+ * be redirected to our hook, but a store to it from here is dropped by iOS JIT
+ * write protection (DXMT's dxgi.dll lives in the FEX MAP_JIT x64 pool). Now that
+ * d3d12core is pure x64 too, the hook is an ordinary x64 pointer -- the only
+ * missing piece is the write. So publish the request in this exported struct and
+ * let MadeiraPad (native, and able to write the pool -- it already does for
+ * _tls_index) apply the vtable patch. */
+#define MADEIRA_DXGI_PATCH_MAGIC 0xD3D12BADC0DEF00DULL
+__declspec(dllexport) volatile struct madeira_dxgi_patch_s {
+    unsigned long long magic;      /* set LAST, once the rest is valid */
+    unsigned long long vtable;     /* pool VA of the IDXGIFactory2 vtable */
+    unsigned long long hook_scfh;  /* &bridge_factory_CreateSwapChainForHwnd */
+    unsigned long long hook_sc;    /* &bridge_factory_CreateSwapChain */
+    unsigned int slot_scfh;        /* vtable index of CreateSwapChainForHwnd */
+    unsigned int slot_sc;          /* vtable index of CreateSwapChain */
+    volatile unsigned int seq;     /* bumped by the bridge on each new request */
+    volatile unsigned int done;    /* set to seq by MadeiraPad once applied */
+} madeira_dxgi_patch;
+
 /* ------------------------------------------------------------------------- */
 /* IDXGIVkSurfaceFactory                                                      */
 /* ------------------------------------------------------------------------- */
@@ -866,25 +886,38 @@ static IDXGIFactory2Vtbl *bridge_hook_factory_vtbl(IDXGIFactory2 *factory, const
     if (vtbl->CreateSwapChainForHwnd == bridge_factory_CreateSwapChainForHwnd)
         return vtbl; /* already hooked (shared vtable) */
 
-    if (!VirtualProtect(vtbl, sizeof(*vtbl), PAGE_READWRITE, &old_protect))
-    {
-        ERR("dxgi bridge: [%s] VirtualProtect on vtbl %p failed, error %lu.\n", how, vtbl, GetLastError());
-        return NULL;
-    }
-
+    /* Capture the originals so the hook can pass D3D11 devices straight through. */
     if (!original_CreateSwapChainForHwnd)
     {
         original_CreateSwapChain = vtbl->CreateSwapChain;
         original_CreateSwapChainForHwnd = vtbl->CreateSwapChainForHwnd;
     }
-    vtbl->CreateSwapChain = bridge_factory_CreateSwapChain;
-    vtbl->CreateSwapChainForHwnd = bridge_factory_CreateSwapChainForHwnd;
-    VirtualProtect(vtbl, sizeof(*vtbl), old_protect, &old_protect);
+
+    /* Try the direct store (works if the vtable is ever writable), then publish
+     * the request for MadeiraPad regardless -- on iOS the store is dropped. */
+    if (VirtualProtect(vtbl, sizeof(*vtbl), PAGE_READWRITE, &old_protect))
+    {
+        vtbl->CreateSwapChain = bridge_factory_CreateSwapChain;
+        vtbl->CreateSwapChainForHwnd = bridge_factory_CreateSwapChainForHwnd;
+        VirtualProtect(vtbl, sizeof(*vtbl), old_protect, &old_protect);
+    }
 
     readback = (void *)vtbl->CreateSwapChainForHwnd;
-    WARN("dxgi bridge: [%s] hooked vtbl %p; slot15 read-back=%p (write %s)\n",
-            how, vtbl, readback,
-            readback == (void *)bridge_factory_CreateSwapChainForHwnd ? "STUCK" : "LOST");
+    if (readback != (void *)bridge_factory_CreateSwapChainForHwnd)
+    {
+        /* Store was lost -> ask MadeiraPad to patch the pool copy. */
+        madeira_dxgi_patch.vtable    = (unsigned long long)(uintptr_t)vtbl;
+        madeira_dxgi_patch.hook_scfh = (unsigned long long)(uintptr_t)bridge_factory_CreateSwapChainForHwnd;
+        madeira_dxgi_patch.hook_sc   = (unsigned long long)(uintptr_t)bridge_factory_CreateSwapChain;
+        madeira_dxgi_patch.slot_scfh = (unsigned int)((void **)&vtbl->CreateSwapChainForHwnd - (void **)vtbl);
+        madeira_dxgi_patch.slot_sc   = (unsigned int)((void **)&vtbl->CreateSwapChain - (void **)vtbl);
+        madeira_dxgi_patch.magic     = MADEIRA_DXGI_PATCH_MAGIC;
+        madeira_dxgi_patch.seq++;
+        WARN("dxgi bridge: [%s] store LOST; posted MadeiraPad patch req vtbl %p slots %u/%u seq %u\n",
+                how, vtbl, madeira_dxgi_patch.slot_sc, madeira_dxgi_patch.slot_scfh, madeira_dxgi_patch.seq);
+    }
+    else
+        WARN("dxgi bridge: [%s] hooked vtbl %p in place (write STUCK)\n", how, vtbl);
     return vtbl;
 }
 
