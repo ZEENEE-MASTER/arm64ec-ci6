@@ -63,7 +63,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: out
-          key: vkd3d-proton-v1-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
+          key: vkd3d-proton-v2-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
 
       - name: Host tools
         if: steps.cache.outputs.cache-hit != 'true'
@@ -150,10 +150,18 @@ jobs:
 
           [properties]
           needs_exe_wrapper = true
-          c_args = ['-march=armv8.2-a', '-marm64x', '-O2', '-ffunction-sections', '-fdata-sections']
-          cpp_args = ['-march=armv8.2-a', '-marm64x', '-O2', '-ffunction-sections', '-fdata-sections', '-include', 'LIBCXX_COMPAT_PATH']
-          c_link_args = ['-marm64x']
-          cpp_link_args = ['-marm64x']
+          # Madeira: pure ARM64EC, NOT ARM64X (-marm64x). ARM64X packs an x64 half
+          # and an ARM64EC half into one PE, each with its own C runtime and thus
+          # its own _tls_index; the loader wires only one to the TLS directory, so
+          # __thread reads through the other (uninitialised, 0xffffffff) and any
+          # thread-local access on the D3D12 swapchain-init path faults (confirmed
+          # on device: wild ldr at TLSbase + 0xffffffff*8). Pure ARM64EC has a
+          # single runtime/_tls_index; x64 callers thunk into the EC code. It is
+          # still x64-loadable, which is all Madeira needs.
+          c_args = ['-march=armv8.2-a', '-O2', '-ffunction-sections', '-fdata-sections']
+          cpp_args = ['-march=armv8.2-a', '-O2', '-ffunction-sections', '-fdata-sections', '-include', 'LIBCXX_COMPAT_PATH']
+          c_link_args = []
+          cpp_link_args = []
 
           [host_machine]
           system = 'windows'
@@ -222,7 +230,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: out
-          key: vkd3d-proton-v1-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
+          key: vkd3d-proton-v2-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
 
       - uses: actions/upload-artifact@v4
         with:
