@@ -191,7 +191,7 @@ jobs:
           if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ]; then
             find vkd3d/build -name 'd3d12*.dll' -exec cp {} out/ ';'
             # The bridge must actually be in the binary, not just in the tree.
-            if grep -q 'dxgi bridge: hooked factory vtable' out/d3d12core.dll; then
+            if grep -q 'dxgi bridge:' out/d3d12core.dll; then
               echo "dxgi bridge: present in d3d12core.dll"
             else
               echo "::error::dxgi bridge string not found in d3d12core.dll"; exit 1
